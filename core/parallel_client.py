@@ -34,9 +34,12 @@ No business logic, no Lance, no Postgres — those live in the per-mode workers.
 
 from __future__ import annotations
 
+import math
 import os
 import random
 import time
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import requests
@@ -81,10 +84,33 @@ def _headers(extra: dict[str, str] | None = None) -> dict[str, str]:
             "PARALLEL_API_KEY not set in the parallel-api Modal secret "
             "(mint it from Doppler core-x/prd before deploy)."
         )
-    headers = {"x-api-key": key, "Content-Type": "application/json", "Accept": "application/json"}
+    headers = {
+        "x-api-key": key, "Content-Type": "application/json", "Accept": "application/json",
+        "User-Agent": "core-x (https://github.com/bencrane/core-x)",
+    }
     if extra:
         headers.update(extra)
     return headers
+
+
+def _retry_delay(retry_after: str | None, attempt: int) -> float:
+    """Honor numeric or HTTP-date Retry-After; ignore unusable server values."""
+    if retry_after:
+        try:
+            delay = float(retry_after)
+        except ValueError:
+            try:
+                deadline = parsedate_to_datetime(retry_after)
+                # Obsolete asctime HTTP dates have no explicit timezone, but are UTC.
+                if deadline.tzinfo is None:
+                    deadline = deadline.replace(tzinfo=timezone.utc)
+                return max(0.0, deadline.timestamp() - time.time())
+            except (ValueError, TypeError, OverflowError):
+                pass
+        else:
+            if math.isfinite(delay) and delay >= 0:
+                return delay
+    return min(30.0, (2 ** attempt) + random.random())
 
 
 def request(
@@ -122,7 +148,7 @@ def request(
             if sc != 429 and sc < 500:  # terminal client error
                 raise ParallelError(f"Parallel {method} {path} → {last}", status=sc, body=resp.text[:500])
             retry_after = resp.headers.get("Retry-After")
-            sleep = float(retry_after) if retry_after else min(30.0, (2 ** i) + random.random())
+            sleep = _retry_delay(retry_after, i)
         except ParallelError:
             raise
         except requests.RequestException as exc:
